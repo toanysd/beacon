@@ -280,6 +280,7 @@
 
     const [modal, setModal] = useState(null); // 'QR_TEMP', 'QUICK', 'ADD', 'SCAN', 'CONTACT_INTENT', 'EDIT', 'SHARE_APP'
     const [scanTarget, setScanTarget] = useState('QUICK'); // track scanner source
+    const [friendRequest, setFriendRequest] = useState(null);
     const [heading, setHeading] = useState(null);
     const [compassGranted, setCompassGranted] = useState(false);
     
@@ -295,9 +296,65 @@
     const activeConnRef = useRef(null);
     const myPosRef = useRef({lat: null, lng: null});
     const geoWatchRef = useRef(null);
+    const audioCtxRef = useRef(null);
 
     const [activeCall, setActiveCall] = useState(null); 
     const [flashData, setFlashData] = useState(null); // { c, m, s }
+
+    // Audio & Vibrate API
+    const initAudio = () => {
+        if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
+        if ("Notification" in window && Notification.permission === "default") {
+            try { Notification.requestPermission(); } catch(e){}
+        }
+    };
+
+    const triggerOSNotification = (title, body) => {
+        if (document.hidden) {
+            let orig = document.title;
+            document.title = `🔴 ${title}`;
+            setTimeout(() => { if(document.hidden) document.title = orig; }, 5000);
+            if ("Notification" in window && Notification.permission === "granted") {
+                try { new Notification(title, { body: body }); } catch(e){}
+            }
+        }
+    };
+
+    useEffect(() => {
+        window.addEventListener('touchstart', initAudio, { once: true });
+        window.addEventListener('click', initAudio, { once: true });
+        const handleVis = () => { if(document.visibilityState === 'visible') document.title = 'Beacon'; };
+        document.addEventListener('visibilitychange', handleVis);
+        return () => document.removeEventListener('visibilitychange', handleVis);
+    }, []);
+
+    const playAlert = (type = 'PING') => {
+        if (!audioCtxRef.current) return;
+        const ctx = audioCtxRef.current;
+        if (ctx.state === 'suspended') ctx.resume();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        if (type === 'PING') {
+            osc.type = 'sine'; osc.frequency.setValueAtTime(880, ctx.currentTime);
+            gain.gain.setValueAtTime(0.5, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
+            osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.2);
+            if(navigator.vibrate) try { navigator.vibrate(100); } catch(e){}
+        } else if (type === 'SOS') {
+            osc.type = 'square'; osc.frequency.setValueAtTime(600, ctx.currentTime);
+            osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + 0.1);
+            osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + 0.2);
+            osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + 0.3);
+            osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + 0.4);
+            gain.gain.setValueAtTime(0.8, ctx.currentTime);
+            gain.gain.linearRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+            osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.5);
+            if(navigator.vibrate) try { navigator.vibrate([200, 100, 200, 100, 400]); } catch(e){}
+        }
+    };
 
     useEffect(() => {
       let savedPerm = localStorage.getItem('beacon_v8_perm');
@@ -322,6 +379,17 @@
          peerPermRef.current?.destroy();
          if(geoWatchRef.current) navigator.geolocation.clearWatch(geoWatchRef.current);
       }
+    }, []);
+
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+                if (peerTempRef.current?.disconnected && !peerTempRef.current.destroyed) peerTempRef.current.reconnect();
+                if (peerPermRef.current?.disconnected && !peerPermRef.current.destroyed) peerPermRef.current.reconnect();
+            }
+        };
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     }, []);
 
     function initDualPeers(tempId, permId) {
@@ -353,6 +421,17 @@
             if(conn.open) { 
                 conn.send({ type: 'ACK', name: myGreeting || 'Thiết bị nhận', channelId });
                 
+                if (d.callerId) {
+                    setContacts(curr => {
+                        if (!curr.find(c => c.id === d.callerId)) {
+                            setFriendRequest({ id: d.callerId, name: peerAlias });
+                            playAlert('PING');
+                            triggerOSNotification("🤝 KẾT BẠN NGẦM", `${peerAlias} muốn lưu thẻ của bạn!`);
+                        }
+                        return curr;
+                    });
+                }
+                
                 // Trigger based on Intent mapped from the Caller
                 if (d.intent === 'SOS') {
                     const customMsg = d.msg && d.msg.trim() !== '' ? d.msg : 'SOS';
@@ -361,6 +440,8 @@
                     const fdCaller = { c: '#DC2626', m: targetBoth ? customMsg : 'SOS', s: 'anim-sos' };
                     conn.send({type: 'FLASH', ...fdCaller});
                     setFlashData(fdReceiver);
+                    playAlert('SOS');
+                    triggerOSNotification("🚨 KHẨN CẤP", `${peerAlias}: ${customMsg}`);
                 } else if (d.intent === 'SYNC') {
                     const randomColor = PALETTE[Math.floor(Math.random() * PALETTE.length)];
                     const customMsg = d.msg && d.msg.trim() !== '' ? d.msg : 'CHỚP';
@@ -369,6 +450,8 @@
                     const fdCaller = { c: randomColor, m: targetBoth ? customMsg : 'CHỚP', s: 'anim-pulse' };
                     conn.send({type: 'FLASH', ...fdCaller});
                     setFlashData(fdReceiver);
+                    playAlert('PING');
+                    triggerOSNotification("⚡ TƯƠNG TÁC", `${peerAlias}: ${customMsg}`);
                 }
             }
           }
@@ -389,7 +472,11 @@
               });
             }
           }
-          if (d.type === 'FLASH') setFlashData({ c: d.c, m: d.m, s: d.s || 'anim-pulse' });
+          if (d.type === 'FLASH') {
+              setFlashData({ c: d.c, m: d.m, s: d.s || 'anim-pulse' });
+              playAlert(d.s === 'anim-sos' ? 'SOS' : 'PING');
+              triggerOSNotification(d.s === 'anim-sos' ? "🚨 FLASH SOS" : "⚡ TƯƠNG TÁC", `Tín hiệu chớp đèn!`);
+          }
           if (d.type === 'END') endSession();
         });
         conn.on('close', endSession);
@@ -496,11 +583,19 @@
       
       setActiveCall({ name: peerAlias || "Hệ thống ẩn danh", channelId: sessionChannel, dist: null, isFixed:false, mode: intent });
       
-      conn.on('open', () => conn.send({ type: 'HELO', name: myGreeting || 'Người Tìm Kiếm', channelId: sessionChannel, intent: intent, msg: flashMsg, msgTarget: flashTarget }));
+      conn.on('open', () => conn.send({ type: 'HELO', name: myGreeting || 'Người Tìm Kiếm', channelId: sessionChannel, intent: intent, msg: flashMsg, msgTarget: flashTarget, callerId: permCode }));
       
       conn.on('data', d => {
         if(d.type === 'ACK') {
            setActiveCall(s => s ? {...s, channelId: d.channelId || s.channelId} : s);
+        }
+        if (d.type === 'ACCEPT_FRIEND') {
+           setContacts(curr => {
+               if (curr.find(c => c.id === d.targetId)) return curr;
+               const nc = [{ id: d.targetId, name: d.name }, ...curr];
+               localStorage.setItem('beacon_v8_contacts', JSON.stringify(nc));
+               return nc;
+           });
         }
         if (d.type === 'GPS') {
             const dp = haversine(myPosRef.current.lat, myPosRef.current.lng, d.lat, d.lng);
@@ -512,13 +607,19 @@
                 if(!prev) { 
                   const fd = { c: '#10B981', m: 'TỚI NƠI', s: 'anim-pulse' };
                   if(activeConnRef.current?.open) activeConnRef.current.send({type: 'FLASH', ...fd});
+                  playAlert('PING');
+                  triggerOSNotification("🎯 20 MÉT!", "Đích đến gần sát bạn!");
                   return fd;
                 }
                 return prev;
               });
             }
         }
-        if (d.type === 'FLASH') setFlashData({ c: d.c, m: d.m, s: d.s || 'anim-pulse' });
+        if (d.type === 'FLASH') {
+            setFlashData({ c: d.c, m: d.m, s: d.s || 'anim-pulse' });
+            playAlert(d.s === 'anim-sos' ? 'SOS' : 'PING');
+            triggerOSNotification(d.s === 'anim-sos' ? "🚨 FLASH SOS" : "⚡ TƯƠNG TÁC", "Đối phương đang vẫy đèn!");
+        }
         if (d.type === 'END') endSession();
       });
       conn.on('close', endSession);
@@ -547,6 +648,20 @@
             const nc = contacts.filter(c => c.id !== id);
             setContacts(nc); localStorage.setItem('beacon_v8_contacts', JSON.stringify(nc));
         }
+    }
+
+    function acceptFriendRequest() {
+       if(friendRequest) {
+          setContacts(curr => {
+              const nc = [{ id: friendRequest.id, name: friendRequest.name }, ...curr.filter(c => c.id !== friendRequest.id)];
+              localStorage.setItem('beacon_v8_contacts', JSON.stringify(nc));
+              return nc;
+          });
+          if(activeConnRef.current?.open) {
+             activeConnRef.current.send({ type: 'ACCEPT_FRIEND', targetId: permCode, name: myGreeting || 'Thiết bị nhận' });
+          }
+          setFriendRequest(null);
+       }
     }
 
     function handleSaveContact() {
@@ -754,7 +869,7 @@
                  <div style={{background: 'var(--white)', border: '2px solid var(--indigo-200)', borderRadius: 16, padding: 18, marginBottom: 24, boxShadow: '0 4px 15px rgba(37,99,235,0.1)'}}>
                     <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
                         <div style={{color:'var(--indigo-600)', fontWeight: 800, fontSize: 12, textTransform:'uppercase', letterSpacing:1}}>{t.sb_perm_title}</div>
-                        <button onClick={() => {if(confirm("Tạo mới sẽ vô hiệu hóa các liên kết cũ?")){setPermCode(genCode());}}} style={{background:'var(--slate-100)', padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:800}}>⟳ Reset</button>
+                        <span style={{background:'var(--indigo-50)', color:'var(--indigo-600)', padding:'4px 8px', borderRadius:8, fontSize:10, fontWeight:800, letterSpacing:1}}>☑ LOCKED</span>
                     </div>
                     
                     <div style={{margin:'14px 0 8px', padding: '16px 0', background:'var(--slate-50)', borderRadius: 12, textAlign:'center'}}>
@@ -791,6 +906,22 @@
         {/* MODALS OVERHAUL */}
         {/* ========================================= */}
 
+        {/* --- Lời Mời Kết Bạn --- */}
+        {friendRequest && (
+          <div className="modal-overlay" style={{zIndex: 99999}}>
+            <div className="modal-sheet" style={{padding: '30px 24px'}}>
+               <div style={{textAlign:'center', marginBottom:20}}>
+                   <div style={{fontSize:48, marginBottom:10}}>🤝</div>
+                   <h3 style={{fontSize:22, fontWeight:900, color:'var(--indigo-600)'}}>Yêu cầu Gắn Kết</h3>
+                   <div style={{color:'var(--slate-500)', fontSize:14, marginTop:10, lineHeight: 1.5}}>Thiết lập kết nối 2 chiều với <strong style={{color:'var(--slate-800)'}}>{friendRequest.name}</strong> (Mã: {fmt(friendRequest.id)}). Bạn có muốn lưu vào Danh bạ để liên kết 2 chiều vĩnh viễn không?</div>
+               </div>
+               <div style={{display:'flex', gap:10, marginTop: 10}}>
+                   <button className="btn-full btn-secondary" onClick={()=>setFriendRequest(null)}>Bỏ qua</button>
+                   <button className="btn-full btn-primary" onClick={acceptFriendRequest}>Đồng Ý & Lưu</button>
+               </div>
+            </div>
+          </div>
+        )}
 
         {/* Contact INTENT Action Sheet */}
         {modal === 'CONTACT_INTENT' && selectedContact && (
